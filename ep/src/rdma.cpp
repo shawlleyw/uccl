@@ -759,6 +759,19 @@ bool probe_gpu_memory_registration(int gpu_idx, size_t bytes, char const* label,
 
 }  // namespace
 
+
+bool has_any_nic() {
+  static bool cached_valid = false;
+  static bool cached = false;
+  if (cached_valid) return cached;
+  int n = 0;
+  struct ibv_device** dl = ibv_get_device_list(&n);
+  cached = (dl != nullptr && n > 0);
+  if (dl) ibv_free_device_list(dl);
+  cached_valid = true;
+  return cached;
+}
+
 bool can_register_gpu_memory_for_rdma(int gpu_idx, size_t bytes) {
   static thread_local std::map<std::pair<int, size_t>, bool> cache;
   auto const key = std::make_pair(gpu_idx, bytes);
