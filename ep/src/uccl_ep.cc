@@ -734,8 +734,10 @@ class Buffer {
     EP_HOST_ASSERT((x_ptr != 0) || (num_tokens == 0));
     EP_HOST_ASSERT((is_token_in_rank_ptr != 0) || (num_tokens == 0));
     EP_HOST_ASSERT(channel_prefix_matrix_ptr != 0);
-    EP_HOST_ASSERT(recv_x_ptr != 0 && recv_channel_prefix_matrix_ptr != 0);
-    EP_HOST_ASSERT(recv_src_idx_ptr != 0 && send_head_ptr != 0);
+    EP_HOST_ASSERT((recv_x_ptr != 0) || (num_recv_tokens == 0));
+    EP_HOST_ASSERT(recv_channel_prefix_matrix_ptr != 0);
+    EP_HOST_ASSERT((recv_src_idx_ptr != 0) || (num_recv_tokens == 0));
+    EP_HOST_ASSERT((send_head_ptr != 0) || (num_tokens == 0));
     EP_HOST_ASSERT(num_tokens >= 0 && hidden > 0 && num_recv_tokens >= 0);
     EP_HOST_ASSERT((hidden * x_element_size) % static_cast<int>(sizeof(int4)) ==
                    0);
