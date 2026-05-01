@@ -1206,10 +1206,6 @@ class Buffer {
                        bool use_fp8, bool round_scale, bool use_ue8m0,
                        bool async, bool return_recv_hook) {
     EP_HOST_ASSERT(low_latency_mode);
-    EP_HOST_ASSERT(x_ptr != 0 && topk_idx_ptr != 0);
-    EP_HOST_ASSERT(packed_recv_x_ptr != 0 && packed_recv_count_ptr != 0);
-    EP_HOST_ASSERT(packed_recv_src_info_ptr != 0 &&
-                   packed_recv_layout_range_ptr != 0);
     EP_HOST_ASSERT(x_rows == topk_rows);
     EP_HOST_ASSERT(x_rows <= num_max_dispatch_tokens_per_rank);
     EP_HOST_ASSERT(x_cols % static_cast<int>(sizeof(int4)) == 0 &&
@@ -1218,7 +1214,6 @@ class Buffer {
     EP_HOST_ASSERT((num_ranks * num_max_dispatch_tokens_per_rank) % 4 == 0 &&
                    "TMA requires the number of tokens to be multiple of 4");
     if (use_fp8) {
-      EP_HOST_ASSERT(packed_recv_x_scales_ptr != 0);
       EP_HOST_ASSERT(x_cols % 512 == 0);
       if (use_ue8m0) EP_HOST_ASSERT(round_scale);
     }
@@ -1308,9 +1303,6 @@ class Buffer {
                       bool use_logfmt, bool zero_copy, bool async,
                       bool return_recv_hook, std::uintptr_t out_ptr) {
     EP_HOST_ASSERT(low_latency_mode);
-    EP_HOST_ASSERT(x_ptr != 0 && topk_idx_ptr != 0 && topk_weights_ptr != 0);
-    EP_HOST_ASSERT(src_info_ptr != 0 && layout_range_ptr != 0);
-    EP_HOST_ASSERT(out_ptr != 0);
 
     auto num_local_experts = num_experts / num_ranks;
     EP_HOST_ASSERT(x_dim0 == num_local_experts);
