@@ -135,6 +135,181 @@ def test_main(
             -1
         )
 
+    # Empty-input rank regression test (SGLang launch_server forward_idle).
+    # Defined and called here so subsequent correctness sweeps are independent.
+    def run_empty_input_rank_test():
+        """
+        LL variant of the SGLang launch_server forward_idle empty-input test.
+        Some ranks provide num_tokens=0 input; others send normally.
+        Validates that the host-side fix (uccl_ep.cc:521,640,732 assert
+        loosening) does not deadlock the LL dispatch/combine kernels.
+        """
+        if num_ranks < 2:
+            return
+
+        empty_ranks = {0, num_ranks - 1}
+        is_empty = rank in empty_ranks
+
+        if rank == 0:
+            print(
+                f"[empty-input-rank-LL] forcing ranks {sorted(empty_ranks)} "
+                f"to send 0 tokens ...",
+                flush=True,
+                end="",
+            )
+
+        # Build per-rank input. Empty ranks: zero-row tensors. The topk_idx
+        # int64 zero-row case is what triggers the topk_idx_ptr=nullptr path
+        # on some PyTorch versions (the case that motivated T3's assert fix).
+        if is_empty:
+            local_x = torch.empty(
+                (0, hidden), dtype=torch.bfloat16, device="cuda"
+            )
+            local_topk_idx = torch.empty(
+                (0, num_topk), dtype=torch.int64, device="cuda"
+            )
+            local_topk_weights = torch.empty(
+                (0, num_topk), dtype=torch.float32, device="cuda"
+            )
+        else:
+            # Encode rank in payload (matching outer scope x construction).
+            local_x = torch.ones(
+                (num_tokens, hidden), dtype=torch.bfloat16, device="cuda"
+            ) * (rank - 128)
+            local_x[:, -128:] = (
+                torch.arange(num_tokens, device="cuda")
+                .to(torch.bfloat16)
+                .view(-1, 1)
+            )
+            # Deterministic round-robin routing across all experts.
+            token_offsets = torch.arange(
+                num_tokens, dtype=torch.int64, device="cuda"
+            ).unsqueeze(1)
+            topk_offsets = torch.arange(
+                num_topk, dtype=torch.int64, device="cuda"
+            ).unsqueeze(0)
+            local_topk_idx = (token_offsets + topk_offsets) % num_experts
+            local_topk_weights = torch.ones(
+                (num_tokens, num_topk), dtype=torch.float32, device="cuda"
+            )
+
+        num_local_experts_local = num_experts // num_ranks
+        cumulative_local_expert_recv_stats = torch.zeros(
+            (num_local_experts_local,), dtype=torch.int, device="cuda"
+        )
+
+        # LL dispatch. The third arg `num_tokens` is the BUFFER CAPACITY shared
+        # across all ranks, NOT the per-rank send count (that's local_x.size(0)).
+        (
+            packed_recv_x,
+            packed_recv_count,
+            handle,
+            event,
+            hook,
+        ) = buffer.low_latency_dispatch(
+            local_x,
+            local_topk_idx,
+            num_tokens,
+            num_experts,
+            use_fp8=False,
+            async_finish=False,
+            return_recv_hook=False,
+            cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats,
+        )
+        event.current_stream_wait()
+
+        # All-gather the per-rank topk_idx for cross-rank verification.
+        # We pad each rank's topk_idx to (num_tokens, num_topk) with -1
+        # (no-route marker) so all_gather produces a uniform
+        # (num_ranks, num_tokens, num_topk) tensor regardless of which ranks
+        # were empty.
+        padded_topk_idx = torch.full(
+            (num_tokens, num_topk),
+            -1,
+            dtype=local_topk_idx.dtype,
+            device="cuda",
+        )
+        if local_topk_idx.size(0) > 0:
+            padded_topk_idx[: local_topk_idx.size(0)] = local_topk_idx
+        all_topk_idx = torch.empty(
+            (num_ranks, num_tokens, num_topk),
+            dtype=local_topk_idx.dtype,
+            device="cuda",
+        )
+        dist.all_gather_into_tensor(all_topk_idx, padded_topk_idx, group=group)
+
+        # Verify recv counts: for each local expert at this rank,
+        # packed_recv_count should equal the count of all_topk_idx ==
+        # global_expert_id summed across all (rank, token) positions.
+        # Empty ranks contribute zero by construction (their padded entries
+        # are all -1 sentinels).
+        for i in range(num_local_experts_local):
+            expert_id = rank * num_local_experts_local + i
+            expected = (all_topk_idx == expert_id).sum().item()
+            actual = int(packed_recv_count[i].item())
+            assert actual == expected, (
+                f"rank {rank} local-expert {i} (global {expert_id}): "
+                f"packed_recv_count={actual} != expected={expected}"
+            )
+            assert (
+                int(cumulative_local_expert_recv_stats[i].item()) == expected
+            ), (
+                f"rank {rank} local-expert {i}: "
+                f"cumulative_local_expert_recv_stats mismatch"
+            )
+
+        # LL combine. We feed packed_recv_x back as the simulated GEMM
+        # output. No FP8 path used here; packed_recv_x is bf16 directly.
+        simulated_gemm_x = (
+            packed_recv_x[0].clone()
+            if isinstance(packed_recv_x, tuple)
+            else packed_recv_x.clone()
+        )
+        combined_x, combine_event, _ = buffer.low_latency_combine(
+            simulated_gemm_x,
+            local_topk_idx,
+            local_topk_weights,
+            handle,
+            use_logfmt=False,
+            async_finish=False,
+            zero_copy=False,
+            return_recv_hook=False,
+        )
+        combine_event.current_stream_wait()
+
+        if is_empty:
+            assert combined_x.size(0) == 0, (
+                f"empty rank {rank}: combined_x.size(0)="
+                f"{combined_x.size(0)} != 0"
+            )
+        else:
+            assert combined_x.size(0) == num_tokens, (
+                f"non-empty rank {rank}: combined_x.size(0)="
+                f"{combined_x.size(0)} != num_tokens={num_tokens}"
+            )
+            # Reconstruction: combined_x ≈ local_x * sum(topk_weights *
+            # (topk_idx != -1)). Since topk_weights is all ones and there
+            # are no -1 entries, sum-per-token == num_topk.
+            weight_sum = (
+                local_topk_weights.masked_fill(local_topk_idx == -1, 0)
+                .sum(dim=1)
+                .view(-1, 1)
+            )
+            expected_combined = local_x.float() * weight_sum
+            diff = calc_diff(expected_combined, combined_x.float())
+            assert torch.isnan(combined_x).sum().item() == 0, (
+                f"non-empty rank {rank}: combined_x has NaN"
+            )
+            assert diff < 1e-3, (
+                f"non-empty rank {rank}: LL combine reconstruction error "
+                f"{diff} >= 1e-3"
+            )
+
+        if rank == 0:
+            print(" passed", flush=True)
+
+    run_empty_input_rank_test()
+
     # Check dispatch correctness
     do_check = True
     hash_value, num_times = 0, 0
