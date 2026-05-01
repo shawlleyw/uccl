@@ -364,6 +364,7 @@ def test_main(
                 cumulative_local_expert_recv_stats=cumulative_recv,
             )
             packed_recv_x, packed_recv_count, handle, event, _ = out
+            event.current_stream_wait()
             sim = (
                 packed_recv_x[0].clone()
                 if isinstance(packed_recv_x, tuple)
@@ -379,6 +380,7 @@ def test_main(
                 zero_copy=False,
                 return_recv_hook=False,
             )
+            combine_event.current_stream_wait()
             return combined_x
 
         populate_full()
