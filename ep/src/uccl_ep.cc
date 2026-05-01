@@ -791,10 +791,12 @@ class Buffer {
         buffer_ptrs_gpu, rank, num_ranks, comm_stream, config.num_sms,
         config.num_max_nvl_chunked_send_tokens,
         config.num_max_nvl_chunked_recv_tokens);
-    auto err = cudaGetLastError();
-    if (err != cudaSuccess) {
-      printf("[intranode_dispatch] kernel launch error: %s\n", cudaGetErrorString(err));
-      fflush(stdout);
+    {
+      auto err = cudaGetLastError();
+      if (err != cudaSuccess) {
+        printf("[intranode_combine] kernel launch error: %s\n", cudaGetErrorString(err));
+        fflush(stdout);
+      }
     }
 
     std::optional<EventHandle> event;
@@ -841,10 +843,12 @@ class Buffer {
         buffer_ptrs_gpu, reinterpret_cast<int*>(send_head_ptr), num_channels,
         num_recv_tokens, num_channels * num_ranks * 2, barrier_signal_ptrs_gpu,
         rank, num_ranks, comm_stream);
-    auto err = cudaGetLastError();
-    if (err != cudaSuccess) {
-      printf("[cached_notify_combine] kernel launch error: %s\n", cudaGetErrorString(err));
-      fflush(stdout);
+    {
+      auto err = cudaGetLastError();
+      if (err != cudaSuccess) {
+        printf("[cached_notify_combine] kernel launch error: %s\n", cudaGetErrorString(err));
+        fflush(stdout);
+      }
     }
 
     void* bias_ptrs[2] = {
