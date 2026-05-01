@@ -212,7 +212,7 @@ def test_main(
             num_tokens,
             num_experts,
             use_fp8=False,
-            async_finish=False,
+            async_finish=True,
             return_recv_hook=False,
             cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats,
         )
@@ -271,7 +271,7 @@ def test_main(
             local_topk_weights,
             handle,
             use_logfmt=False,
-            async_finish=False,
+            async_finish=True,
             zero_copy=False,
             return_recv_hook=False,
         )
