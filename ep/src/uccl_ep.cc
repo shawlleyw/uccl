@@ -518,11 +518,7 @@ class Buffer {
       std::uintptr_t is_token_in_rank_ptr,
       std::optional<EventHandle>& previous_event, bool async,
       bool allocate_on_comm_stream, std::uintptr_t compute_stream_ptr) {
-    EP_HOST_ASSERT((topk_idx_ptr != 0) || (num_tokens == 0));
-    EP_HOST_ASSERT(num_tokens >= 0);  // explicit non-negative guard for empty-input case
-    EP_HOST_ASSERT(num_tokens_per_rank_ptr != 0);
-    EP_HOST_ASSERT(num_tokens_per_expert_ptr != 0);
-    EP_HOST_ASSERT((is_token_in_rank_ptr != 0) || (num_tokens == 0));
+    EP_HOST_ASSERT(num_tokens >= 0);
     EP_HOST_ASSERT(num_experts > 0);
 
     auto compute_stream = reinterpret_cast<cudaStream_t>(compute_stream_ptr);
@@ -640,11 +636,6 @@ class Buffer {
                     std::uintptr_t compute_stream_ptr) {
     EP_HOST_ASSERT(num_tokens >= 0);
     EP_HOST_ASSERT(num_experts > 0);
-    EP_HOST_ASSERT(num_tokens_per_rank_ptr != 0);
-    EP_HOST_ASSERT((is_token_in_rank_ptr != 0) || (num_tokens == 0));
-    EP_HOST_ASSERT(num_tokens_per_expert_ptr != 0);
-    EP_HOST_ASSERT(rank_prefix_matrix_ptr != 0);
-    EP_HOST_ASSERT(channel_prefix_matrix_ptr != 0);
 
     EP_HOST_ASSERT(config.num_sms % 2 == 0);
     int num_channels = config.num_sms / 2;
@@ -731,13 +722,6 @@ class Buffer {
       std::uintptr_t recv_src_idx_ptr, std::uintptr_t send_head_ptr,
       std::optional<EventHandle>& previous_event, bool async,
       bool allocate_on_comm_stream, std::uintptr_t compute_stream_ptr) {
-    EP_HOST_ASSERT((x_ptr != 0) || (num_tokens == 0));
-    EP_HOST_ASSERT((is_token_in_rank_ptr != 0) || (num_tokens == 0));
-    EP_HOST_ASSERT(channel_prefix_matrix_ptr != 0);
-    EP_HOST_ASSERT((recv_x_ptr != 0) || (num_recv_tokens == 0));
-    EP_HOST_ASSERT(recv_channel_prefix_matrix_ptr != 0);
-    EP_HOST_ASSERT((recv_src_idx_ptr != 0) || (num_recv_tokens == 0));
-    EP_HOST_ASSERT((send_head_ptr != 0) || (num_tokens == 0));
     EP_HOST_ASSERT(num_tokens >= 0 && hidden > 0 && num_recv_tokens >= 0);
     EP_HOST_ASSERT((hidden * x_element_size) % static_cast<int>(sizeof(int4)) ==
                    0);
@@ -752,7 +736,6 @@ class Buffer {
       stream_wait(comm_stream, compute_stream);
     }
     if (cached_mode) {
-      EP_HOST_ASSERT(rank_prefix_matrix_ptr != 0);
       int num_memset_int = num_channels * num_ranks * 4;
       uccl::intranode::cached_notify_dispatch(
           reinterpret_cast<int*>(rank_prefix_matrix_ptr), num_memset_int,
@@ -822,10 +805,6 @@ class Buffer {
       std::uintptr_t recv_topk_weights_ptr,
       std::optional<EventHandle>& previous_event, bool async,
       bool allocate_on_comm_stream, std::uintptr_t compute_stream_ptr) {
-    EP_HOST_ASSERT(x_ptr != 0 && src_idx_ptr != 0 &&
-                   rank_prefix_matrix_ptr != 0);
-    EP_HOST_ASSERT(channel_prefix_matrix_ptr != 0 && send_head_ptr != 0);
-    EP_HOST_ASSERT(recv_x_ptr != 0);
     EP_HOST_ASSERT((hidden * x_element_size) % static_cast<int>(sizeof(int4)) ==
                    0);
 
