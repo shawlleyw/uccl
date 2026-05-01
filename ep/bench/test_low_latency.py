@@ -407,6 +407,19 @@ def test_main(
             g.replay()
         torch.cuda.synchronize()
 
+        for outer in range(20):
+            populate_full()
+            _ = one_call()
+            torch.cuda.synchronize()
+
+            if is_empty_for_replay:
+                populate_empty_pattern()
+            else:
+                populate_full()
+            for _ in range(3):
+                g.replay()
+            torch.cuda.synchronize()
+
         del g
         if rank == 0:
             print(" passed", flush=True)
