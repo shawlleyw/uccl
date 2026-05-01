@@ -54,37 +54,187 @@ boundary and asserts on tensor *properties* (`.dim()`, `.size()`, `.dtype()`,
 `uintptr_t` and only had pointer-non-null as a substitute, which fails on
 allocators that return `0` for zero-byte buffers.
 
-### Bug B: UCCL LL kernel deadlocks under CUDA graph replay with empty input
+### Bug B: UCCL LL kernel cross-rank desync under heterogeneous load
 
 **Status: NOT fixed by this branch. Workaround documented below.**
 
+**Initially mis-diagnosed as a CUDA-graph-specific bug.** Subsequent verification
+on H200 with `--disable-cuda-graph` showed the same deadlock — CUDA graphs are
+NOT the trigger. The actual bug is in eager LL kernels under any code path that
+produces asymmetric per-rank work.
+
 After Bug A is fixed, `launch_server` still deadlocks when run with
-`--deepep-mode auto` (the default) on traffic that produces empty ranks.
-Stack inspection via `py-spy dump --pid <scheduler>` (with
-`CUDA_LAUNCH_BLOCKING=1` so Python frames reflect actual kernel state)
-shows all 4 DP schedulers stuck identically:
+`--deepep-mode auto` on traffic that produces asymmetric per-rank load
+(some ranks idle, others doing real work). The deadlock occurs in EAGER
+mode (`--disable-cuda-graph`) too, so CUDA graphs are not involved.
+
+#### Smoking-gun evidence (instrumented run on 4×H200)
+
+With Python-level prints in `qwen3_moe.py` at the MoE block boundary and
+kernel-level `printf` in UCCL's LL `dispatch` and `combine` recv-wait spin
+loops, the layer-position of each rank when stuck was:
 
 ```
-replay (torch/cuda/graphs.py:117)               # cudaGraphLaunch
-replay (cuda_graph_runner.py:885)
-_forward_raw (model_runner.py:2330)
-forward (model_runner.py:2297)
+rank 0:  layer 44, 45, 46, 47, layer 0   ← finished 48 layers, started NEXT forward
+rank 1:  layer 44, 45, 46, 47, layer 0   ← same
+rank 3:  layer 44, 45, 46, 47, layer 0   ← same
+rank 2:  layer 30, 31, 32, 33, layer 34  ← STUCK on layer 34 of FIRST forward
 ```
 
-The captured CUDA graph is hung. Because the captured graph for decode is
-captured with `is_extend_in_batch=False`, the AUTO mode resolves it to
-LOW_LATENCY kernels (see [Mode Resolution Trace](#mode-resolution-trace)).
-The captured LL graph contains UCCL EP's LL `dispatch` and `combine` kernels.
+Qwen3-30B-A3B has 48 transformer blocks. **Ranks 0/1/3 raced 14+ layers
+ahead of rank 2.** Rank 2 is the rank with real work (the warmup request
+sequence); ranks 0/1/3 are in `forward_idle` (no tokens, fast path).
 
-DeepEP's equivalent LL kernels under the same configuration work — that
-combination has been used for production benchmarks. UCCL's LL kernels work
-in **eager** mode for empty input (verified by the regression tests in this
-branch). The bug is specifically at the intersection of LL + CUDA-graph
-replay + asymmetric empty input.
+Concurrently, the LL kernel `printf` showed rank 2 spinning in
+`combine_recv_ipc` waiting for `rdma_recv_flag[expert] != 0` from `src=0`,
+where the cycle counter exceeded 100 seconds without progress.
 
-Root-causing this bug requires kernel-level diff against DeepEP and is left
-as future work (see [Next Steps](#next-steps)). Until it is fixed, users
-must work around it.
+#### Why this should be impossible (and what it means)
+
+The LL `dispatch` and `combine` kernels are all-to-all collectives. Every
+rank must participate in every collective for it to complete. If rank 2
+hadn't reached layer 35's `dispatch`, ranks 0/1/3 should NOT have been able
+to complete layer 35's `dispatch` — they would have hung waiting for rank
+2's contribution.
+
+The fact that ranks 0/1/3 advanced 14 layers past rank 2 means **the
+all-to-all is not actually synchronizing — fast ranks are completing the
+collective without rank 2's participation, by reading stale buffer data**.
+
+#### The mechanism: 2-buffer toggle without proper cleanup
+
+UCCL EP's LL implementation uses a 2-buffer toggle (mirrored from DeepEP):
+
+```cpp
+// uccl_ep.cc:1230-1232 (and 1328-1330 in combine)
+int low_latency_buffer_idx_used = low_latency_buffer_idx;
+auto buffer = layout.buffers[low_latency_buffer_idx];
+auto next_buffer = layout.buffers[low_latency_buffer_idx ^= 1];
+```
+
+The kernel cleans the "next" buffer (the one that will be used in the
+following call) inside the dispatch:
+
+```cpp
+// internode_ll.cu:295-308 (UCCL's in-kernel cleanup)
+if (sm_id == 0) {
+  for (int i = lane_id; i < num_next_clean_int; i += WARP_SIZE) {
+    next_clean[i] = 0;
+    next_clean_second[i] = 0;
+  }
+  __syncwarp();
+  for (int i = lane_id; i < num_experts; i += WARP_SIZE)
+    atomic_add_release_global(atomic_finish_counter_per_expert + i,
+                              FINISHED_SUM_TAG);
+}
+```
+
+The 2-buffer scheme assumes ranks stay roughly in sync. With high skew, the
+fast ranks rotate through both buffers many times while the slow rank is
+still on its first buffer. The fast ranks read recv-count slots that the
+slow rank either hasn't written yet, OR wrote in a previous round and
+weren't cleaned in time. With the `-num_tokens_sent - 1` sentinel encoding,
+a stale value of `-1` (from a previous round's empty-send) decodes to
+`num_recv_tokens = 0` — indistinguishable from "this round's empty send".
+
+Fast ranks treat the stale sentinel as "this round's contribution is 0" and
+proceed. They iterate forward through layers. The slow rank eventually
+catches up, but its buffer state is now corrupted by the fast ranks'
+multiple round-trips, and the in-kernel atomic counters
+(`atomic_finish_counter_per_expert`) are in inconsistent states across
+ranks.
+
+#### What this is NOT
+
+- **Not a CUDA-graph issue.** Reproduced with `--disable-cuda-graph`.
+- **Not solved by mask + timeout.** A timeout escape (DeepEP-style)
+  converts the hang into a print + recovery, but does not prevent the
+  underlying state corruption that allowed fast ranks to skip the slow
+  rank. Confirmed not the right fix.
+- **Not specific to empty input.** Any rank that is significantly faster
+  than its peers will trigger the race. Empty input is the most common
+  cause of speed asymmetry in production.
+
+#### The actual missing piece: cross-rank barrier in `clean_low_latency_buffer`
+
+Direct comparison reveals UCCL EP has the cross-rank barriers in
+`clean_low_latency_buffer` **commented out**:
+
+```cpp
+// uccl/ep/src/internode_ll.cu:23-38
+__launch_bounds__(kNumThreads, 1) __global__
+    void clean_low_latency_buffer(int* clean_0, int num_clean_int_0,
+                                  int* clean_1, int num_clean_int_1) {
+  // Barrier before cleaning (in case of unfinished chunked EP)
+  // nvshmemx_barrier_all_block();          ← COMMENTED OUT
+  ...
+  // Barrier after cleaning (make sure the low-latency mode works fine)
+  // nvshmemx_barrier_all_block();          ← COMMENTED OUT
+}
+```
+
+DeepEP's equivalent ([`internode_ll.cu:73-102`](file:///home/shaoyuw/DeepEP/csrc/kernels/internode_ll.cu#L73-L102))
+calls EITHER `nvshmemx_barrier_all_block()` (when NVSHMEM IBGDA is
+available) OR a custom `barrier()` function (lines 23-70) that performs a
+cross-rank counter-based barrier using a `sync_buffer_ptr`:
+
+```cpp
+// DeepEP's barrier function uses a per-rank counter
+__forceinline__ __device__ void barrier(int thread_id, int rank, int num_ranks,
+                                        int* mask_buffer_ptr,
+                                        int* sync_buffer_ptr) {
+    atomicAdd(sync_buffer_ptr + rank, -1);          // decrement own counter
+    int cnt = sync_buffer_ptr[rank];
+    // Write our counter to every peer's slot via IPC, then wait for
+    // all peers' counters to match the new value.
+    while (ld_acquire_sys_global(sync_buffer_ptr + dst_rank) != cnt
+           && wait_recv_cost <= NUM_TIMEOUT_CYCLES)
+        ;
+    ...
+}
+```
+
+The barrier is invoked unconditionally inside DeepEP's
+`clean_low_latency_buffer`, both at entry and exit. UCCL EP commented out
+the equivalent calls when replacing NVSHMEM IBGDA with its CPU proxy
+implementation, but did not provide a replacement.
+
+#### Why this is the root cause
+
+`clean_low_latency_buffer` is called by sglang at NORMAL→LL mode
+transitions ([`deepep.py:226-244`](file:///home/shaoyuw/sglang/python/sglang/srt/layers/moe/token_dispatcher/deepep.py#L226-L244)).
+Without the cross-rank barrier:
+
+- Some ranks finish the cleanup memset earlier than others.
+- Earliest rank starts the first LL `dispatch`, writes its
+  `-num_tokens_sent - 1` sentinel into the recv buffers of its peers.
+- A still-cleaning rank's memset then overwrites those sentinels back to 0.
+- The first rank's send is lost. Receivers spin on `== 0` forever.
+- Over many subsequent LL iterations, fast ranks treat stale or zeroed
+  buffer slots as "this round's empty contribution" and proceed without
+  the slow rank actually participating.
+
+This explains the observed 14-layer skew: an initial cleanup race sets up
+buffer state inconsistency, then per-iteration drift compounds.
+
+#### Recommended fix direction (not implemented in this branch)
+
+Implement a UCCL-compatible cross-rank barrier and call it from
+`clean_low_latency_buffer`. The DeepEP `sync_buffer_ptr` approach (line
+23-70 of DeepEP's `internode_ll.cu`) ports cleanly to UCCL's IPC peer
+pointer infrastructure:
+
+1. Add `sync_buffer_ptr` as a member of UCCL's `Buffer` class (one int per
+   rank, allocated in IPC-mapped memory).
+2. Port DeepEP's `barrier()` function into UCCL's `internode_ll.cu`.
+3. Uncomment the calls in `clean_low_latency_buffer` and replace
+   `nvshmemx_barrier_all_block()` with the new ported `barrier()`.
+4. Pass `sync_buffer_ptr` through to `clean_low_latency_buffer` and the
+   barrier function.
+
+Estimated 50-100 lines across 2-3 files. The fix does not require
+modifying the dispatch or combine kernels themselves — only the cleanup
+path that runs at mode transitions.
 
 ## Workaround for Bug B: `--deepep-mode normal`
 
