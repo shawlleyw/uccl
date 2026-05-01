@@ -111,6 +111,12 @@ __global__ __launch_bounds__(1024, 1) void dispatch(
   amd::barrier_init(1);
 #endif
 
+  if (sm_id == 0 && thread_id == 0) {
+    printf("[DBG dispatch_kernel_enter] rank=%d num_tokens=%d ll_buf=%d phases=%d clk=%llu\n",
+           rank, num_tokens, low_latency_buffer_idx, phases,
+           (unsigned long long)clock64());
+  }
+
   // Sending phase
   if ((phases & LOW_LATENCY_SEND_PHASE) == 0) goto LOW_LATENCY_DISPATCH_RECV;
 
@@ -410,14 +416,34 @@ __global__ __launch_bounds__(1024, 1) void dispatch(
         shared_num_tokens_sent_per_expert[responsible_expert_idx -
                                           sm_id * num_warp_groups];
     // Wait local sends issued and send expert counts
-    while (ld_acquire_global<kUseAggressiveAtomic>(
-               atomic_finish_counter_per_expert + responsible_expert_idx) !=
-           FINISHED_SUM_TAG * 2)
+    {
+      auto _start_t = clock64();
+      auto _last_print_t = _start_t;
+      bool _printed_finish_wait = false;
+      while (ld_acquire_global<kUseAggressiveAtomic>(
+                 atomic_finish_counter_per_expert + responsible_expert_idx) !=
+             FINISHED_SUM_TAG * 2) {
+        auto _now_t = clock64();
+        if (!_printed_finish_wait && responsible_expert_idx < 8) {
+          int _val = ld_acquire_global<kUseAggressiveAtomic>(
+              atomic_finish_counter_per_expert + responsible_expert_idx);
+          printf("[DBG dispatch_finish_wait] rank=%d resp_expert=%d ENTER val=%d expected=%d\n",
+                 rank, responsible_expert_idx, _val, FINISHED_SUM_TAG * 2);
+          _printed_finish_wait = true;
+        }
+        if (_now_t - _last_print_t > 2000000000ULL && responsible_expert_idx < 4) {
+          int _val = ld_acquire_global<kUseAggressiveAtomic>(
+              atomic_finish_counter_per_expert + responsible_expert_idx);
+          printf("[DBG dispatch_finish_wait] rank=%d resp_expert=%d STILL waiting %llu cycles val=%d expected=%d\n",
+                 rank, responsible_expert_idx,
+                 (unsigned long long)(_now_t - _start_t), _val, FINISHED_SUM_TAG * 2);
+          _last_print_t = _now_t;
+        }
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
-      __builtin_amdgcn_s_sleep(1);
-#else
-      ;
+        __builtin_amdgcn_s_sleep(1);
 #endif
+      }
+    }
 
     auto dst_ptr = reinterpret_cast<uint64_t>(
         rdma_recv_count + dst_expert_local_idx * num_ranks + rank);
@@ -797,6 +823,12 @@ __global__ __launch_bounds__(1024, 1) void combine(
   EP_STATIC_ASSERT(num_bytes_per_slot % sizeof(int4) == 0,
                    "Invalid vectorization");
 
+  if (sm_id == 0 && thread_id == 0) {
+    printf("[DBG combine_kernel_enter] rank=%d num_combined=%d ll_buf=%d phases=%d clk=%llu\n",
+           rank, num_combined_tokens, low_latency_buffer_idx, phases,
+           (unsigned long long)clock64());
+  }
+
   // Sending phase
   if ((phases & LOW_LATENCY_SEND_PHASE) == 0) goto LOW_LATENCY_COMBINE_RECV;
 
@@ -1063,12 +1095,26 @@ __global__ __launch_bounds__(1024, 1) void combine(
     EP_DEVICE_ASSERT(num_warps_per_group > 1 and num_warp_groups < 16);
     sync_barrier<true>(warp_group_id + 1, num_warps_per_group * WARP_SIZE);
     if (sub_warp_id == 1 and lane_id == 0) {
-      while (ld_acquire_global<kUseAggressiveAtomic>(atomic_clean_flag) == 0)
+      auto _start_t = clock64();
+      auto _last_print_t = _start_t;
+      bool _printed_clean_wait = false;
+      while (ld_acquire_global<kUseAggressiveAtomic>(atomic_clean_flag) == 0) {
+        auto _now_t = clock64();
+        if (!_printed_clean_wait && responsible_expert_idx < 8) {
+          printf("[DBG combine_send_clean_wait] rank=%d resp_expert=%d ENTER\n",
+                 rank, responsible_expert_idx);
+          _printed_clean_wait = true;
+        }
+        if (_now_t - _last_print_t > 2000000000ULL && responsible_expert_idx < 4) {
+          printf("[DBG combine_send_clean_wait] rank=%d resp_expert=%d STILL waiting %llu cycles\n",
+                 rank, responsible_expert_idx,
+                 (unsigned long long)(_now_t - _start_t));
+          _last_print_t = _now_t;
+        }
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
         __builtin_amdgcn_s_sleep(1);
-#else
-        ;
 #endif
+      }
       // Calculate offset from data buffer to flag buffer (similar to dispatch
       // phase) rdma_recv_flag_internode corresponds to
       // combine_rdma_recv_flag_buffer We need to calculate the offset from
@@ -1084,6 +1130,11 @@ __global__ __launch_bounds__(1024, 1) void combine(
                                       dst_rank, max_nvl_peers, 0)
               : 0;
       if (dst_p2p_ptr != 0) {
+        if (responsible_expert_idx < 16) {
+          printf("[DBG combine_send_ipc] rank=%d dst_rank=%d global_expert=%d resp=%d dst_p2p=%p ll_buf=%d\n",
+                 rank, dst_rank, global_expert_idx, responsible_expert_idx,
+                 (void*)dst_p2p_ptr, low_latency_buffer_idx);
+        }
         // Intra-node: use direct atomic operation
         st_release_sys_global<kUseAggressiveAtomic>(
             reinterpret_cast<int*>(dst_p2p_ptr), 1);
