@@ -137,22 +137,12 @@ def test_main(
 
     # Empty-input rank regression test (SGLang launch_server forward_idle).
     # Defined and called here so subsequent correctness sweeps are independent.
-    def run_empty_input_rank_test():
-        """
-        LL variant of the SGLang launch_server forward_idle empty-input test.
-        Some ranks provide num_tokens=0 input; others send normally.
-        Validates that the host-side fix (uccl_ep.cc:521,640,732 assert
-        loosening) does not deadlock the LL dispatch/combine kernels.
-        """
-        if num_ranks < 2:
-            return
-
-        empty_ranks = {0, num_ranks - 1}
+    def _run_empty_input_scenario_ll(empty_ranks, label):
         is_empty = rank in empty_ranks
 
         if rank == 0:
             print(
-                f"[empty-input-rank-LL] forcing ranks {sorted(empty_ranks)} "
+                f"[empty-input-rank-LL/{label}] forcing ranks {sorted(empty_ranks)} "
                 f"to send 0 tokens ...",
                 flush=True,
                 end="",
@@ -307,6 +297,17 @@ def test_main(
 
         if rank == 0:
             print(" passed", flush=True)
+
+    def run_empty_input_rank_test():
+        if num_ranks < 2:
+            return
+        _run_empty_input_scenario_ll(
+            empty_ranks={0, num_ranks - 1}, label="edges"
+        )
+        _run_empty_input_scenario_ll(
+            empty_ranks=set(range(1, num_ranks)),
+            label="single-producer",
+        )
 
     run_empty_input_rank_test()
 

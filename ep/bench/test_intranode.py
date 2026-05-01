@@ -266,23 +266,12 @@ def test_main(
         if local_rank == 0:
             print(" passed", flush=True)
 
-    def run_empty_input_rank_test():
-        """
-        Test SGLang launch_server forward_idle case: some ranks provide num_tokens=0
-        input while others send normally. Validates that the host-side fix
-        (uccl_ep.cc:521,640,732 assert loosening) does not deadlock and produces
-        correct dispatch+combine results.
-        """
-        if num_ranks < 2:
-            return
-
-        # Empty-input rank set: first and last ranks (covers both edges).
-        empty_ranks = {0, num_ranks - 1}
+    def _run_empty_input_scenario(empty_ranks, label):
         is_empty = rank in empty_ranks
 
         if local_rank == 0:
             print(
-                f"[empty-input-rank] forcing ranks {sorted(empty_ranks)} to send 0 tokens ...",
+                f"[empty-input-rank/{label}] forcing ranks {sorted(empty_ranks)} to send 0 tokens ...",
                 flush=True,
                 end="",
             )
@@ -471,6 +460,17 @@ def test_main(
 
         if local_rank == 0:
             print(" passed", flush=True)
+
+    def run_empty_input_rank_test():
+        if num_ranks < 2:
+            return
+        _run_empty_input_scenario(
+            empty_ranks={0, num_ranks - 1}, label="edges"
+        )
+        _run_empty_input_scenario(
+            empty_ranks=set(range(1, num_ranks)),
+            label="single-producer",
+        )
 
     for previous_mode in (False, True):
         for async_mode in (False, True):
