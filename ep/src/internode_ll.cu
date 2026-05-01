@@ -430,6 +430,11 @@ __global__ __launch_bounds__(1024, 1) void dispatch(
                                     max_nvl_peers, 0)
             : 0;
     if (dst_p2p_ptr == 0) {
+      if (responsible_expert_idx < 8) {
+        printf("[DBG dispatch_send_ibgda] rank=%d dst_rank=%d dst_expert_local=%d "
+               "num_tokens_sent=%d via_proxy\n",
+               rank, dst_rank, dst_expert_local_idx, num_tokens_sent);
+      }
       // Inter-node or no IPC: use IBGDA atomic
       uccl::nvshmemi_ibgda_amo_nonfetch_add(
           dst_ptr_internode, reinterpret_cast<uint64_t>(atomic_buffer_ptr),
@@ -438,6 +443,12 @@ __global__ __launch_bounds__(1024, 1) void dispatch(
           false, d2h_channel_addrs, num_d2h_channel_addrs, false,
           low_latency_buffer_idx);
     } else {
+      if (responsible_expert_idx < 8) {
+        printf("[DBG dispatch_send_ipc] rank=%d dst_rank=%d dst_expert_local=%d "
+               "num_tokens_sent=%d sentinel=%d dst_p2p=%p\n",
+               rank, dst_rank, dst_expert_local_idx, num_tokens_sent,
+               -num_tokens_sent - 1, (void*)dst_p2p_ptr);
+      }
       // Intra-node: use direct atomic operation
       st_release_sys_global<kUseAggressiveAtomic>(
           reinterpret_cast<int*>(dst_p2p_ptr), -num_tokens_sent - 1);
