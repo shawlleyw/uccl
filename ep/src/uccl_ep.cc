@@ -518,7 +518,8 @@ class Buffer {
       std::uintptr_t is_token_in_rank_ptr,
       std::optional<EventHandle>& previous_event, bool async,
       bool allocate_on_comm_stream, std::uintptr_t compute_stream_ptr) {
-    EP_HOST_ASSERT(topk_idx_ptr != 0);
+    EP_HOST_ASSERT((topk_idx_ptr != 0) || (num_tokens == 0));
+    EP_HOST_ASSERT(num_tokens >= 0);  // explicit non-negative guard for empty-input case
     EP_HOST_ASSERT(num_tokens_per_rank_ptr != 0);
     EP_HOST_ASSERT(num_tokens_per_expert_ptr != 0);
     EP_HOST_ASSERT(is_token_in_rank_ptr != 0);
