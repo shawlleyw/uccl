@@ -507,15 +507,30 @@ LOW_LATENCY_DISPATCH_RECV:
 #endif
     if (sub_warp_id == 1 and lane_id == 0) {
       auto start_time = clock64();
+      auto last_print_time = start_time;
+      bool printed_entry = false;
       while ((src_rank / max_nvl_peers == rank / max_nvl_peers) &&
              (num_recv_tokens_ipc = ld_acquire_sys_global<kUseAggressiveAtomic>(
                   rdma_recv_count + local_expert_idx * num_ranks + src_rank)) ==
-                 0)
+                 0) {
+        auto now = clock64();
+        if (!printed_entry && responsible_expert_idx == 0) {
+          printf("[DBG dispatch_recv_ipc] rank=%d local_expert=%d src_rank=%d "
+                 "responsible_expert=%d ENTER spin\n",
+                 rank, local_expert_idx, src_rank, responsible_expert_idx);
+          printed_entry = true;
+        }
+        if (now - last_print_time > 2000000000ULL && responsible_expert_idx < 4) {
+          printf("[DBG dispatch_recv_ipc] rank=%d src=%d exp=%d STILL waiting "
+                 "%llu cycles\n",
+                 rank, src_rank, responsible_expert_idx,
+                 (unsigned long long)(now - start_time));
+          last_print_time = now;
+        }
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
         __builtin_amdgcn_s_sleep(1);
-#else
-        ;
 #endif
+      }
 
       while ((src_rank / max_nvl_peers != rank / max_nvl_peers) &&
              (num_recv_tokens_internode =
@@ -1092,14 +1107,29 @@ LOW_LATENCY_COMBINE_RECV:
     if (sub_warp_id == 0 and lane_id == 0) {
       auto const src_rank = responsible_expert_idx / num_local_experts;
       auto start_time = clock64();
+      auto last_print_time = start_time;
+      bool printed_entry = false;
       while ((src_rank / max_nvl_peers == rank / max_nvl_peers) &&
              ld_acquire_sys_global<kUseAggressiveAtomic>(
-                 rdma_recv_flag + responsible_expert_idx) == 0)
+                 rdma_recv_flag + responsible_expert_idx) == 0) {
+        auto now = clock64();
+        if (!printed_entry && responsible_expert_idx < 8) {
+          printf("[DBG combine_recv_ipc] rank=%d responsible_expert=%d "
+                 "src_rank=%d ENTER spin\n",
+                 rank, responsible_expert_idx, src_rank);
+          printed_entry = true;
+        }
+        if (now - last_print_time > 2000000000ULL && responsible_expert_idx < 8) {
+          printf("[DBG combine_recv_ipc] rank=%d resp_expert=%d src=%d STILL "
+                 "waiting %llu cycles\n",
+                 rank, responsible_expert_idx, src_rank,
+                 (unsigned long long)(now - start_time));
+          last_print_time = now;
+        }
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
         __builtin_amdgcn_s_sleep(1);
-#else
-        ;
 #endif
+      }
 
       while ((src_rank / max_nvl_peers != rank / max_nvl_peers) &&
              ld_acquire_sys_global<kUseAggressiveAtomic>(
