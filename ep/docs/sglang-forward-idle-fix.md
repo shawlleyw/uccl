@@ -1,201 +1,353 @@
 # UCCL EP — SGLang `launch_server` `forward_idle` Fix
 
+## Status
+
+This document describes a **partial fix** for a deadlock that affects
+`sglang.launch_server --moe-a2a-backend deepep` on the UCCL EP fork. The fix
+addresses the host-side cliff that caused the most-visible symptom. There is
+also a **separate, unfixed kernel-level bug** described in the
+[Remaining Bug](#remaining-bug-ll-kernel-under-cuda-graph-replay) section
+below; the workaround is documented but not yet eliminated at the source.
+
 ## Symptom
 
-When SGLang runs with `--moe-a2a-backend deepep` in `launch_server` mode, some GPU ranks
-enter a state where `nvidia-smi` shows 100% GPU utilization but 0% memory bandwidth. The
-process eventually crashes with:
+When SGLang runs `launch_server` with `--moe-a2a-backend deepep` and traffic
+is heterogeneous across DP ranks, the cluster enters a deadlocked state:
+
+- `nvidia-smi` reports 100% GPU utilization but 0% memory bandwidth on every rank.
+- The CPU polling loop in `ep/src/uccl_ep.cc:697` eventually raises
+  `RuntimeError: DeepEP error: CPU recv timeout`.
+- The watchdog at `scheduler_runtime_checker_mixin.py` may fire first
+  (`Watchdog timeout (self.watchdog_timeout=300)`) and kill the schedulers.
+
+`bench_one_batch` does not reproduce the hang because it broadcasts the same
+batch size to every DP rank — every rank always has `num_tokens > 0` and the
+asymmetric-empty case never occurs.
+
+## Two Layered Bugs
+
+The full deadlock is the result of two distinct bugs that were initially
+conflated. Separating them is essential for understanding what this fix does
+and does not address.
+
+### Bug A: Host-side asserts reject zero-token input
+
+**Status: fixed by this branch.**
+
+SGLang's `launch_server` schedules data-parallel forward passes. When a DP
+rank has no sequences for the current step, `forward_idle()` is invoked with
+empty input tensors. The MoE layer calls
+`buffer.get_dispatch_layout(topk_ids, …)` with `topk_ids` of shape
+`(0, num_topk)`. PyTorch's allocator returns `data_ptr() == 0` for zero-byte
+buffers on this CUDA build (verified empirically on H200, see Background).
+
+UCCL EP's host wrappers used `EP_HOST_ASSERT(_ptr != 0)` checks in many
+places. Those checks fired on the empty rank, raised a C++ exception, and
+prevented its kernel from launching. Other ranks then waited forever in
+`barrier_block` for the empty rank to participate. After
+`UCCL_EP_CPU_TIMEOUT_SECS` (~100 s) the CPU polling loop raised the timeout.
+
+This branch removes those `_ptr != 0` checks in the affected wrappers,
+mirroring DeepEP's design: DeepEP takes `at::Tensor` objects at the C++
+boundary and asserts on tensor *properties* (`.dim()`, `.size()`, `.dtype()`,
+`.is_contiguous()`) which all hold for zero-row tensors. UCCL EP takes raw
+`uintptr_t` and only had pointer-non-null as a substitute, which fails on
+allocators that return `0` for zero-byte buffers.
+
+### Bug B: UCCL LL kernel deadlocks under CUDA graph replay with empty input
+
+**Status: NOT fixed by this branch. Workaround documented below.**
+
+After Bug A is fixed, `launch_server` still deadlocks when run with
+`--deepep-mode auto` (the default) on traffic that produces empty ranks.
+Stack inspection via `py-spy dump --pid <scheduler>` (with
+`CUDA_LAUNCH_BLOCKING=1` so Python frames reflect actual kernel state)
+shows all 4 DP schedulers stuck identically:
 
 ```
-RuntimeError: DeepEP error: CPU recv timeout
+replay (torch/cuda/graphs.py:117)               # cudaGraphLaunch
+replay (cuda_graph_runner.py:885)
+_forward_raw (model_runner.py:2330)
+forward (model_runner.py:2297)
 ```
 
-The timeout originates at `ep/src/uccl_ep.cc:697`, where the CPU polling loop waits for
-a response from a peer rank that never arrives. The hang is permanent once triggered.
+The captured CUDA graph is hung. Because the captured graph for decode is
+captured with `is_extend_in_batch=False`, the AUTO mode resolves it to
+LOW_LATENCY kernels (see [Mode Resolution Trace](#mode-resolution-trace)).
+The captured LL graph contains UCCL EP's LL `dispatch` and `combine` kernels.
 
-Running `bench_one_batch` with the same model and EP configuration works without issue.
-The failure is specific to `launch_server` with real heterogeneous request traffic.
+DeepEP's equivalent LL kernels under the same configuration work — that
+combination has been used for production benchmarks. UCCL's LL kernels work
+in **eager** mode for empty input (verified by the regression tests in this
+branch). The bug is specifically at the intersection of LL + CUDA-graph
+replay + asymmetric empty input.
 
-## Root Cause
+Root-causing this bug requires kernel-level diff against DeepEP and is left
+as future work (see [Next Steps](#next-steps)). Until it is fixed, users
+must work around it.
 
-SGLang's `launch_server` uses data-parallel (DP) scheduling. Different DP ranks may
-receive different numbers of sequences per forward step. When a rank receives zero
-sequences, it calls `buffer.get_dispatch_layout(topk_ids, ...)` with a zero-element
-`topk_ids` tensor. PyTorch returns `data_ptr() == 0` (null pointer) for zero-element
-tensors in some versions.
+## Workaround for Bug B: `--deepep-mode normal`
 
-Three host-side asserts in `uccl_ep.cc` fire immediately for the empty rank:
+SGLang automatically disables CUDA graphs when `--deepep-mode normal` is set.
+The relevant code in
+[`server_args.py:1428-1432`](file:///home/shaoyuw/sglang/python/sglang/srt/server_args.py#L1428-L1432):
 
-- `:521` `EP_HOST_ASSERT(topk_idx_ptr != 0)` — in `get_dispatch_layout`
-- `:640` `EP_HOST_ASSERT(num_tokens > 0)` — in `intranode_prepare`
-- `:732` `EP_HOST_ASSERT(num_tokens > 0 && hidden > 0 && ...)` — in `intranode_dispatch`
+```python
+def _handle_a2a_moe(self):
+    if self.moe_a2a_backend == "deepep":
+        if self.deepep_mode == "normal":
+            logger.warning("Cuda graph is disabled because deepep_mode=`normal`")
+            self.disable_cuda_graph = True
+```
 
-When any of these asserts fires, the empty rank's kernel never launches. The other ranks
-proceed normally and enter `barrier_block`, waiting for the empty rank to participate in
-the collective. The empty rank never joins. The CPU polling loop at `:697` spins until
-`UCCL_EP_CPU_TIMEOUT_SECS` (~100 seconds) elapses, then raises the timeout error.
+With CUDA graphs disabled, decode runs through the eager NORMAL kernels.
+UCCL EP's NORMAL kernels are empty-safe (verified by T1 audit and the
+intranode regression test). Combined with the host-side fix in Bug A, this
+configuration produces a working `launch_server` on a single-node 4-GPU H200.
 
-The root cause is that the host-side guards were written assuming `num_tokens > 0` is
-always true, which holds for `bench_one_batch` but not for `launch_server` with
-heterogeneous DP batches.
+The trade-off: decode performance is worse without CUDA graphs (no
+amortization of kernel launch overhead). For single-node test deployments
+this is acceptable. For production multi-node serving, Bug B must be fixed
+in the kernel.
 
-## Why `bench_one_batch` Worked
+UCCL's own bench scripts at `ep/bench/sglang/` use this approach. The
+`launch_uep` helper in `common_launch.sh` sets `--deepep-mode normal` for
+all production-style runs (`Qwen3-30B_uep.sh`, `Qwen3-235B_uep.sh`).
 
-`bench_one_batch` broadcasts the same batch to all DP ranks simultaneously. Every rank
-always has `num_tokens > 0`, so the three asserts never fire. The asymmetric case (some
-ranks empty, others not) only occurs in `launch_server` with real heterogeneous request
-traffic, where different clients connect to different DP ranks and the per-step token
-counts diverge.
+## Mode Resolution Trace
 
-## Kernel-Level Empty Safety (Verified)
+For reference, the auto-mode resolution that triggers Bug B:
 
-Before loosening the host-side guards, T1 verified that all 7 kernel mechanisms handle
-`num_tokens == 0` correctly. The verification was read-only (no source files modified).
+**SGLang enforces cross-rank mode consistency.** All DP ranks always pick the
+same DeepEP mode for a given forward step. The mechanism is an OR-reduce on
+`is_extend_in_batch` across all ranks
+([`scheduler.py:2183-2240`](file:///home/shaoyuw/sglang/python/sglang/srt/managers/scheduler.py#L2183-L2240)):
 
-| VP | Mechanism | Verdict |
-|----|-----------|---------|
-| 1 | Intranode dispatch: sender sentinel writes unconditional | VERIFIED EMPTY-SAFE |
-| 2 | Intranode dispatch: receiver decodes sentinel, loop guard exits | VERIFIED EMPTY-SAFE |
-| 3 | LL dispatch: atomic counter math reaches `FINISHED_SUM_TAG * 2` | VERIFIED EMPTY-SAFE |
-| 4 | LL dispatch: count-send value is `-num_tokens_sent - 1` | VERIFIED EMPTY-SAFE |
-| 5 | LL dispatch: receiver decodes sentinel, skips token-copy loop | VERIFIED EMPTY-SAFE |
-| 6 | LL combine: finishing-flag send unconditional; proxy converts value to 1 | VERIFIED EMPTY-SAFE |
-| 7 | LL combine: receive-side wait spins on `== 0`, exits when proxy delivers 1 | VERIFIED EMPTY-SAFE |
+```python
+# Each rank computes its local is_extend
+is_extend_in_batch = local_batch.forward_mode.is_extend() if local_batch else False
 
-Key findings:
+# All-gather across all DP ranks
+torch.distributed.all_gather_into_tensor(global_info.flatten(), local_info, group=group)
+is_extend_in_batch = global_info[:, 0, 3].tolist()  # [F, F, T, T]
 
-**Intranode dispatch (VP1-VP2).** The sender's `st_relaxed_sys_global` calls that write
-the `-v - 1` sentinel encoding are gated only by `lane_id == 0 && send_warp_id_in_rank == 0`,
-not by any `num_tokens > 0` predicate. They execute before the per-token send loop. When
-`num_tokens == 0`, the prefix matrix entries are all zero, so the sentinel value is `-1`.
-The receiver's spin-wait exits on `-1` (non-zero), decodes to `num_tokens_to_recv = 0`,
-and the copy loop at line 460 runs zero iterations.
+# OR-reduce: any prefilling rank → all ranks see True
+local_batch.is_extend_in_batch = any(is_extend_in_batch)
+```
 
-**LL dispatch (VP3-VP5).** When `num_tokens == 0`, the per-token counting loop contributes
-`0` to the atomic counter. The cleanup warp unconditionally adds `+FINISHED_SUM_TAG`, and
-the count-reduction warp adds `+FINISHED_SUM_TAG - 0`. The final counter value is
-`2 * FINISHED_SUM_TAG`, which matches the wait predicate exactly. The count-send value
-`-num_tokens_sent - 1 = -1` is non-zero, so the receiver's spin-wait exits and decodes
-to `num_recv_tokens = 0`.
+Then mode resolution at
+[`utils.py:99-106`](file:///home/shaoyuw/sglang/python/sglang/srt/layers/moe/utils.py#L99-L106):
 
-**LL combine finishing flag (VP6-VP7).** The previously uncertain path: the IBGDA combine
-branch at `internode_ll.cu:1071` passes `num_tokens_to_send` as the value, which is `0`
-for an empty-input rank. However, the CPU proxy at `rdma.cpp:2230, 2518, 2559, 3212`
-unconditionally rewrites `value = 1` whenever `is_combine` is set on the command. The
-IPC path at line 1063 writes the literal `1` directly. Both paths guarantee a non-zero
-value reaches the receiver's flag slot, so the receiver's `== 0` spin-wait exits cleanly.
+```python
+def resolve(self, is_extend_in_batch: bool) -> DeepEPMode:
+    if self != DeepEPMode.AUTO:
+        return self                       # explicit normal or low_latency: stays
+    if is_extend_in_batch:
+        return DeepEPMode.NORMAL          # any rank prefilling → all use NORMAL
+    else:
+        return DeepEPMode.LOW_LATENCY     # all ranks decoding/idle → all use LL
+```
 
-The T1 conclusion: kernels are empty-safe end-to-end. Only the host-side guards needed
-loosening. T5 (kernel-side patches) was not needed.
+The CUDA graph runner captures graphs in DECODE forward mode only
+([`cuda_graph_runner.py:263`](file:///home/shaoyuw/sglang/python/sglang/srt/model_executor/cuda_graph_runner.py#L263))
+and passes `is_extend_in_batch=False` to the DeepEP adapter
+([`cuda_graph_runner.py:711, 730`](file:///home/shaoyuw/sglang/python/sglang/srt/model_executor/cuda_graph_runner.py#L711-L730)).
+With AUTO mode that resolves to LOW_LATENCY, so the captured graph contains
+LL kernels. With NORMAL mode that resolves to NORMAL — but `disable_cuda_graph
+= True` was already set, so no graph is captured at all.
 
-## Fix Applied
+## Background: Empirical PyTorch Behavior on This Cluster
 
-Three changes were made across two commits (T2/T3 and T4), all in `ep/src/uccl_ep.cc`.
+Tested on H200 inside the Modal container:
 
-| Change | File | Before | After | Rationale |
-|--------|------|--------|-------|-----------|
-| T2a | `uccl_ep.cc:640` | `EP_HOST_ASSERT(num_tokens > 0)` | `EP_HOST_ASSERT(num_tokens >= 0)` | Empty input is valid; negative values still rejected |
-| T2b | `uccl_ep.cc:732` | `EP_HOST_ASSERT(num_tokens > 0 && hidden > 0 && ...)` | `EP_HOST_ASSERT(num_tokens >= 0 && hidden > 0 && ...)` | Same rationale; `hidden > 0` preserved |
-| T3 | `uccl_ep.cc:521` | `EP_HOST_ASSERT(topk_idx_ptr != 0)` | `EP_HOST_ASSERT((topk_idx_ptr != 0) \|\| (num_tokens == 0))` + `EP_HOST_ASSERT(num_tokens >= 0)` | PyTorch may return `data_ptr() == 0` for zero-element tensors; the layout kernel's loop is bounded by `num_tokens`, so no dereference occurs when `num_tokens == 0` |
-| T4 | `uccl_ep.cc` | No launch-error checks on intranode kernel launches | `cudaGetLastError()` after each of 5 intranode kernel launches | Mirrors the LL host wrapper pattern; converts silent kernel-launch failures into logged errors |
+```
+torch.empty((0, 4),    dtype=bool,        device='cuda').data_ptr() = 0
+torch.empty((0, 4),    dtype=int64,       device='cuda').data_ptr() = 0
+torch.empty((0, 4096), dtype=bfloat16,    device='cuda').data_ptr() = 0
+torch.empty((0, 4),    dtype=float32,     device='cuda').data_ptr() = 0
+```
 
-The internode-normal asserts at `:882` and `:985` (`EP_HOST_ASSERT(num_tokens > 0 && ...)`)
-were deliberately left unchanged. Those code paths are out of scope for this fix.
+The CUDA caching allocator on this build returns `0` for every zero-byte
+allocation regardless of dtype. The behavior is allocator-dependent in
+general — PyTorch documentation does not guarantee non-null `data_ptr()` for
+empty tensors — but on this cluster it is reliably `0`. This is the trigger
+for Bug A's pointer-null asserts.
 
-## Regression Tests
+## Fix Applied (Bug A only)
 
-Two regression tests guard against re-introducing the `forward_idle` deadlock. Both
-follow the existing `run_zero_recv_rank_test` convention (nested function inside
-`test_main`, plain `assert` statements, status printed from rank 0).
+All changes are in `ep/src/uccl_ep.cc`. The pointer-non-null checks in four
+host wrappers are removed entirely, mirroring DeepEP. Property-based asserts
+(`num_tokens >= 0`, `num_experts > 0`, `hidden > 0`, shape divisibility) are
+preserved.
 
-| Test | File | Function | What it exercises |
-|------|------|----------|-------------------|
-| Intranode | `ep/bench/test_intranode.py:269` | `run_empty_input_rank_test()` | Ranks `{0, num_ranks-1}` send `num_tokens=0`. Verifies `get_dispatch_layout` (T3 path), `dispatch` recv counts, empty-source zero contribution via `rank_prefix_matrix`, cached dispatch, combine reconstruction. |
-| Low-Latency | `ep/bench/test_low_latency.py:140` | `run_empty_input_rank_test()` | Same empty-rank set. Verifies `low_latency_dispatch` recv counts (cross-rank via padded all-gather), empty-rank `combined_x.size(0) == 0`, non-empty rank reconstruction within `1e-3`. |
+| Wrapper | Original asserts | Final state |
+|---------|------------------|-------------|
+| `get_dispatch_layout` (~`:521`) | `topk_idx_ptr != 0`, `num_tokens_per_rank_ptr != 0`, `num_tokens_per_expert_ptr != 0`, `is_token_in_rank_ptr != 0`, `num_experts > 0` | Only `num_tokens >= 0` and `num_experts > 0` remain |
+| `intranode_prepare` (~`:640`) | `num_tokens > 0`, `num_experts > 0`, plus several `_ptr != 0` checks | Only `num_tokens >= 0` and `num_experts > 0` remain |
+| `intranode_dispatch` (~`:732`) | `_ptr != 0` checks for `x_ptr`, `is_token_in_rank_ptr`, `recv_x_ptr`, etc., plus `num_tokens > 0 && hidden > 0 && num_recv_tokens >= 0` | `num_tokens >= 0 && hidden > 0 && num_recv_tokens >= 0` plus shape divisibility |
+| `intranode_combine` (~`:823`) | `_ptr != 0` checks for `x_ptr`, `src_idx_ptr`, `rank_prefix_matrix_ptr`, `channel_prefix_matrix_ptr`, `send_head_ptr`, `recv_x_ptr`, plus shape divisibility | Only shape divisibility remains |
+| `low_latency_dispatch` (~`:1209`) | `_ptr != 0` checks for `x_ptr`, `topk_idx_ptr`, `packed_recv_x_ptr`, `packed_recv_count_ptr`, `packed_recv_src_info_ptr`, `packed_recv_layout_range_ptr`, `packed_recv_x_scales_ptr` (when `use_fp8`) | All removed; property/shape asserts preserved |
+| `low_latency_combine` (~`:1311`) | `_ptr != 0` checks for `x_ptr`, `topk_idx_ptr`, `topk_weights_ptr`, `src_info_ptr`, `layout_range_ptr`, `out_ptr` | All removed; shape/dim asserts preserved |
 
-Both tests:
+The internode-normal asserts at `:882` and `:985` were left unchanged. Those
+code paths are out of scope for this fix.
 
-- Skip when `num_ranks < 2`
-- Use deterministic round-robin routing on non-empty ranks (avoids RNG divergence)
-- Construct empty ranks with `(0, hidden)` `x`, `(0, num_topk)` int64 `topk_idx`,
-  `(0, num_topk)` `topk_weights` — the int64 zero-row tensor is what triggers
-  `data_ptr() == 0` on some PyTorch versions, exercising the T3 disjunction
-- Are called once per `test_main` invocation, alongside the existing correctness sweeps
-
-Run on a Hopper cluster with `torchrun --standalone --nproc_per_node=8 ep/bench/test_intranode.py`
-or `torchrun --standalone --nproc_per_node=8 ep/bench/test_low_latency.py`. Either test
-deadlocking or asserting indicates a regression in the host-side or kernel-side empty-input
-handling.
-
-## Deliberately Deferred: `mask_buffer_ptr` Port
-
-DeepEP includes a hang-recovery system controlled by `enable_shrink=True` on the Buffer
-constructor. When enabled, a `mask_buffer_ptr` is allocated and `is_rank_masked()` can
-return `true` for ranks that are unreachable, allowing the collective to proceed without
-them. This is a separate mechanism from empty-input handling.
-
-SGLang creates the UCCL EP buffer without `enable_shrink=True`. As a result,
-`mask_buffer_ptr = nullptr` and `is_rank_masked()` always returns `false` in production.
-This system is not what makes DeepEP handle empty input; it's a separate concern for
-tolerating unreachable ranks.
-
-Porting `mask_buffer_ptr` support to UCCL EP would require:
-
-1. Kernel signature changes in `internode_ll.cu` to accept and check the mask pointer
-2. Buffer class changes in `uccl_ep.cc` to allocate and expose the mask buffer
-3. Python wrapper changes in `deep_ep_wrapper/` to surface `enable_shrink` to callers
-4. SGLang calling `clean_mask_buffer()` between forward passes
-
-This is deferred as a separate hardening plan. The current fix (T2-T4) addresses the
-immediate `launch_server` deadlock without requiring any of the above.
+`cudaGetLastError()` checks were also added after each of the 5 intranode
+kernel launches in `uccl_ep.cc`, mirroring the existing pattern in the LL
+host wrappers. This converts silent kernel-launch failures (e.g., from
+invalid grid configurations on edge-case input) into logged errors.
 
 ## Verification
 
-Verification for this fix is code-level only. The development machine (A100) cannot
-compile or run UCCL EP, which requires Hopper (sm_90) or an AMD-supported architecture.
+### What was verified
 
-Evidence files are in `.sisyphus/evidence/`:
+| Path | Method | Result |
+|------|--------|--------|
+| Eager intranode dispatch + combine, empty input on some ranks | Unit test (`test_intranode.py:269` two scenarios) on 4×H200 | PASSED |
+| Eager LL dispatch + combine, empty input on some ranks | Unit test (`test_low_latency.py:140` two scenarios) on 4×H200 | PASSED |
+| `launch_server` with `--deepep-mode normal` (CUDA graphs auto-disabled) + heterogeneous curl requests | End-to-end on 4×H200 | PASSED — server stays healthy across multiple requests |
+| Existing intranode/LL correctness sweeps | Existing unit tests | PASSED (no regressions) |
 
-- `task-1-sentinel-verification.md` (or `q1-sentinel-verification.md`) — T1 kernel audit
-- `task-2-asserts.txt` — T2 assert changes at lines 640 and 732
-- `task-3-disjunction.txt` — T3 disjunction at line 521
-- `task-4-launch-checks.txt` — T4 `cudaGetLastError` additions (5 calls)
+### What was NOT verified
 
-Runtime cluster validation is the user's responsibility on a Hopper cluster after
-applying this patch. Recommended test: run SGLang `launch_server` with
-`--moe-a2a-backend deepep` and trigger `forward_idle` by having heterogeneous DP batch
-sizes across ranks (e.g., send requests to only one DP rank while others are idle).
+| Path | Why not |
+|------|---------|
+| LL dispatch + combine under CUDA graph replay, with empty input | Unit tests do not capture CUDA graphs; this path is Bug B and is unfixed |
+| `launch_server` with `--deepep-mode auto` (CUDA graphs enabled, decode uses LL graph) | Hangs deterministically on heterogeneous traffic — this is Bug B |
+| `launch_server` with `--deepep-mode low_latency` | Same code path as auto-decode; expected to hit Bug B |
+| Multi-node deployment | Cluster is single-node; multi-node may surface additional CPU-proxy interactions |
+
+### Regression tests added
+
+| Test | File | Scenarios |
+|------|------|-----------|
+| `run_empty_input_rank_test` | `ep/bench/test_intranode.py:269` | (a) `edges`: ranks `{0, num_ranks-1}` empty. (b) `single-producer`: ranks `{1, …, num_ranks-1}` empty. |
+| `run_empty_input_rank_test` | `ep/bench/test_low_latency.py:140` | Same two scenarios. |
+
+Both tests use deterministic round-robin routing on non-empty ranks (avoids
+RNG divergence) and construct empty ranks with `(0, hidden)` `x`,
+`(0, num_topk)` int64 `topk_idx`, and `(0, num_topk)` `topk_weights`. The
+int64 zero-row tensor is what triggers `data_ptr() == 0`, exercising the
+removed pointer-null checks.
+
+**Limitation: these tests only cover eager mode.** They do not exercise
+CUDA graphs and therefore cannot catch Bug B. A regression test for Bug B
+would need to manually capture and replay a CUDA graph that includes the LL
+kernels with empty input — that work is part of fixing Bug B.
+
+To run on a Hopper cluster:
+
+```
+torchrun --standalone --nproc_per_node=8 ep/bench/test_intranode.py
+torchrun --standalone --nproc_per_node=8 ep/bench/test_low_latency.py
+```
+
+## Remaining Bug: LL Kernel Under CUDA Graph Replay
+
+This bug is unresolved in this branch. Documenting what is known so the next
+person can pick it up.
+
+### What we know
+
+1. UCCL EP's LL `dispatch` and `combine` kernels work correctly in eager
+   mode for empty input — the unit tests prove this.
+2. They work correctly under CUDA graph capture+replay for non-empty input
+   (this is the standard case used by every prior bench).
+3. They deadlock under CUDA graph capture+replay when one or more ranks
+   have empty input on replay. Stack signature: all ranks stuck in
+   `cudaGraphLaunch` (replay), GPU at 100% util / 0% memory.
+4. DeepEP's LL kernels do not deadlock under the same conditions.
+
+### What we do not know yet
+
+- Which specific operation in the captured graph hangs. A `cuda-gdb attach`
+  on a stuck process would show the kernel-side instruction pointer.
+- Whether the bug is in the CPU proxy path (`uccl::nvshmemi_ibgda_*`), the
+  IPC direct path (`st_release_sys_global`), or shared between them.
+- Whether the `low_latency_buffer_idx` host-side toggle interacts badly
+  with CUDA graphs (the captured graph would always reference the buffer
+  index value at capture time).
+
+### Recommended next steps to fix Bug B
+
+1. **Reproduce in a controlled unit test.** Extend `test_low_latency.py`
+   with a scenario that wraps the dispatch+combine pair in `torch.cuda.graph()`
+   with the empty-rank pattern. This isolates the bug from sglang's
+   complexity.
+
+2. **Run with `cuda-gdb`.** Attach to a stuck scheduler, get the kernel
+   instruction pointer, identify the spinning instruction. Likely candidates:
+   a `while (ld_acquire_sys_global(...) == 0)` spin in the LL receiver
+   path that never sees the sentinel value because the captured graph
+   doesn't propagate the sentinel write correctly.
+
+3. **Compare LL kernel host wrappers between UCCL and DeepEP.** Look for:
+   - Pre-launch `cudaMemset`/`cudaMemsetAsync` calls — if these are not
+     captured into the graph, state from a previous call leaks into the
+     next replay
+   - Buffer index handling — UCCL uses `low_latency_buffer_idx ^= 1`
+     host-side and passes the value as a kernel arg. DeepEP may handle this
+     differently (e.g., per-buffer captured graphs)
+   - The `clean_low_latency_buffer` mechanism — when is it called and how
+     does it interact with graph capture
+
+4. **Check the CPU proxy.** If UCCL's CPU proxy path is involved, the
+   FIFO-relayed atomic-add for the count-send sentinel may not be visible
+   to the receiver inside a captured graph because the proxy thread is
+   external to the graph.
 
 ## Files Modified
 
-- `ep/src/uccl_ep.cc` — host-side fixes on branch `fix/sglang-forward-idle-empty-input`:
-  - `79b894c fix(ep): allow num_tokens=0 in intranode_prepare and intranode_dispatch host wrappers` (T2)
-  - `fd10252 fix(ep): permit topk_idx=nullptr when num_tokens=0 in get_dispatch_layout host wrapper` (T3)
-  - `1a1f683 chore(ep): mirror LL host wrapper's cudaGetLastError pattern in intranode launches` (T4)
-- `ep/bench/test_intranode.py` — regression test:
-  - `8634b9b test(ep): add intranode empty-input regression test for SGLang forward_idle` (T8)
-- `ep/bench/test_low_latency.py` — regression test:
-  - `dd598cc test(ep): add LL empty-input regression test for SGLang forward_idle` (T9)
+```
+ep/src/uccl_ep.cc                    host-side fix (Bug A)
+ep/bench/test_intranode.py           regression test (eager mode only)
+ep/bench/test_low_latency.py         regression test (eager mode only)
+ep/docs/sglang-forward-idle-fix.md   this document
+```
 
-## Files Deliberately NOT Modified
+Branch: `fix/sglang-forward-idle-empty-input` on
+`github.com/shawlleyw/uccl`.
 
-- `ep/src/internode.cu` — internode-normal mode; out of scope for this fix
-- `ep/src/internode_ll.cu` — LL kernels verified empty-safe by T1 (VP3-VP7); no changes needed
-- `ep/src/intranode.cu` — intranode kernels verified empty-safe by T1 (VP1-VP2); no changes needed
-- `ep/src/layout.cu` — `get_dispatch_layout` kernel loop is bounded by `num_tokens`; no changes needed
-- `ep/src/proxy.cpp`, `ep/src/rdma.cpp`, `ep/src/fifo.cpp`, `ep/src/uccl_proxy.cpp` — CPU proxy layer; read-only for VP6/VP7 verification
-- `ep/src/uccl_ep.cc:882`, `ep/src/uccl_ep.cc:985` — internode-normal asserts preserved; out of scope
-- `~/sglang/**` — out of scope per user decision; SGLang calls the UCCL EP API correctly
-- `~/DeepEP/**` — used as reference only for parity checks during T1 audit
+## Files Deliberately Not Modified
+
+- `ep/src/internode.cu` — internode-normal mode; out of scope
+- `ep/src/intranode.cu`, `ep/src/internode_ll.cu`, `ep/src/layout.cu` —
+  kernel files; eager-mode empty safety verified in unit tests, no changes
+  needed for Bug A
+- `ep/src/proxy.cpp`, `ep/src/rdma.cpp`, `ep/src/fifo.cpp`,
+  `ep/src/uccl_proxy.cpp` — CPU proxy layer; not modified, but suspected
+  involvement in Bug B (see [Recommended next steps](#recommended-next-steps-to-fix-bug-b))
+- `~/sglang/**` — out of scope; SGLang's behavior is correct
+- `~/DeepEP/**` — used as reference only
 
 ## Next Steps
 
-1. Apply this patch to a Hopper cluster and run `launch_server` with heterogeneous DP
-   batches to confirm the fix eliminates the `forward_idle` deadlock.
+1. Validate this branch on a Hopper cluster with `--deepep-mode normal` and
+   real (non-dummy) weights. The current validation used `--load-format
+   dummy` for speed; a real-weights run gives the final smoke test.
 
-2. If hang-recovery for unreachable ranks is needed in production, create a separate plan
-   for porting the `mask_buffer_ptr` / `enable_shrink` system (see "Deliberately Deferred"
-   section above).
+2. Decide on Bug B fix priority. If single-node `launch_server` with
+   `--deepep-mode normal` is acceptable for the immediate use case, Bug B
+   can be deferred. If `--deepep-mode auto` (with CUDA graphs) is required
+   for production decode performance, Bug B must be fixed. The fix recipe
+   in [Recommended next steps](#recommended-next-steps-to-fix-bug-b) is the
+   starting point.
 
-3. Consider upstreaming this fix to the UCCL EP main branch via a pull request, with the
-   T1 kernel-safety audit as supporting evidence.
+3. Consider upstreaming this branch to the UCCL EP main repository.
+
+## Caveats and Honest Assessment
+
+- The "kernel-level empty safety" audit (T1 in the original work plan)
+  produced a verdict of "no kernel changes needed" based on source reading
+  alone. That verdict was correct for **eager mode**, which is what the
+  audit examined. It was **not** correct as a general statement: Bug B
+  exists and is in those same kernels under different execution conditions
+  (CUDA graph replay). A more rigorous audit would have explicitly noted
+  that CUDA-graph behavior was out of scope and untested. This document
+  corrects that omission.
+- The regression tests added in this branch will catch any future
+  re-introduction of Bug A (host-side asserts on empty input). They will
+  not catch Bug B because they do not capture CUDA graphs.
+- The `--deepep-mode normal` workaround works because SGLang itself
+  disables CUDA graphs in that mode. It is not a long-term fix; production
+  performance demands `auto` (or `low_latency`) for decode.

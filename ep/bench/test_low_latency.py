@@ -311,6 +311,117 @@ def test_main(
 
     run_empty_input_rank_test()
 
+    def _run_cuda_graph_asymmetric_scenario(empty_ranks, label):
+        is_empty_for_replay = rank in empty_ranks
+        if rank == 0:
+            print(
+                f"[ll-cudagraph-asym/{label}] empty_ranks={sorted(empty_ranks)} ...",
+                flush=True,
+                end="",
+            )
+
+        x_buf = torch.zeros(
+            (num_tokens, hidden), dtype=torch.bfloat16, device="cuda"
+        )
+        topk_idx_buf = torch.zeros(
+            (num_tokens, num_topk), dtype=torch.int64, device="cuda"
+        )
+        topk_weights_buf = torch.ones(
+            (num_tokens, num_topk), dtype=torch.float32, device="cuda"
+        )
+        cumulative_recv = torch.zeros(
+            (num_experts // num_ranks,), dtype=torch.int, device="cuda"
+        )
+
+        def populate_full():
+            x_buf.fill_(rank - 127)
+            x_buf[:, -128:] = (
+                torch.arange(num_tokens, device="cuda")
+                .to(torch.bfloat16)
+                .view(-1, 1)
+            )
+            t_off = torch.arange(
+                num_tokens, dtype=torch.int64, device="cuda"
+            ).unsqueeze(1)
+            k_off = torch.arange(
+                num_topk, dtype=torch.int64, device="cuda"
+            ).unsqueeze(0)
+            topk_idx_buf.copy_((t_off + k_off) % num_experts)
+
+        def populate_empty_pattern():
+            x_buf.zero_()
+            topk_idx_buf.fill_(-1)
+
+        def one_call():
+            out = buffer.low_latency_dispatch(
+                x_buf,
+                topk_idx_buf,
+                num_tokens,
+                num_experts,
+                use_fp8=False,
+                async_finish=True,
+                return_recv_hook=False,
+                cumulative_local_expert_recv_stats=cumulative_recv,
+            )
+            packed_recv_x, packed_recv_count, handle, event, _ = out
+            sim = (
+                packed_recv_x[0].clone()
+                if isinstance(packed_recv_x, tuple)
+                else packed_recv_x.clone()
+            )
+            combined_x, combine_event, _ = buffer.low_latency_combine(
+                sim,
+                topk_idx_buf,
+                topk_weights_buf,
+                handle,
+                use_logfmt=False,
+                async_finish=True,
+                zero_copy=False,
+                return_recv_hook=False,
+            )
+            return combined_x
+
+        populate_full()
+        for _ in range(3):
+            _ = one_call()
+        torch.cuda.synchronize()
+
+        side_stream = torch.cuda.Stream()
+        side_stream.wait_stream(torch.cuda.current_stream())
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.stream(side_stream):
+            with torch.cuda.graph(g, stream=side_stream):
+                _ = one_call()
+        torch.cuda.current_stream().wait_stream(side_stream)
+
+        for _ in range(3):
+            g.replay()
+        torch.cuda.synchronize()
+
+        if is_empty_for_replay:
+            populate_empty_pattern()
+
+        for _ in range(5):
+            g.replay()
+        torch.cuda.synchronize()
+
+        del g
+        if rank == 0:
+            print(" passed", flush=True)
+
+    def run_cuda_graph_asymmetric_test():
+        if num_ranks < 2:
+            return
+        _run_cuda_graph_asymmetric_scenario(
+            empty_ranks={0, num_ranks - 1}, label="edges"
+        )
+        _run_cuda_graph_asymmetric_scenario(
+            empty_ranks=set(range(1, num_ranks)),
+            label="single-producer",
+        )
+
+    run_cuda_graph_asymmetric_test()
+
     # Check dispatch correctness
     do_check = True
     hash_value, num_times = 0, 0
