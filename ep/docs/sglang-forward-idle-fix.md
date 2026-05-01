@@ -102,6 +102,31 @@ Three changes were made across two commits (T2/T3 and T4), all in `ep/src/uccl_e
 The internode-normal asserts at `:882` and `:985` (`EP_HOST_ASSERT(num_tokens > 0 && ...)`)
 were deliberately left unchanged. Those code paths are out of scope for this fix.
 
+## Regression Tests
+
+Two regression tests guard against re-introducing the `forward_idle` deadlock. Both
+follow the existing `run_zero_recv_rank_test` convention (nested function inside
+`test_main`, plain `assert` statements, status printed from rank 0).
+
+| Test | File | Function | What it exercises |
+|------|------|----------|-------------------|
+| Intranode | `ep/bench/test_intranode.py:269` | `run_empty_input_rank_test()` | Ranks `{0, num_ranks-1}` send `num_tokens=0`. Verifies `get_dispatch_layout` (T3 path), `dispatch` recv counts, empty-source zero contribution via `rank_prefix_matrix`, cached dispatch, combine reconstruction. |
+| Low-Latency | `ep/bench/test_low_latency.py:140` | `run_empty_input_rank_test()` | Same empty-rank set. Verifies `low_latency_dispatch` recv counts (cross-rank via padded all-gather), empty-rank `combined_x.size(0) == 0`, non-empty rank reconstruction within `1e-3`. |
+
+Both tests:
+
+- Skip when `num_ranks < 2`
+- Use deterministic round-robin routing on non-empty ranks (avoids RNG divergence)
+- Construct empty ranks with `(0, hidden)` `x`, `(0, num_topk)` int64 `topk_idx`,
+  `(0, num_topk)` `topk_weights` — the int64 zero-row tensor is what triggers
+  `data_ptr() == 0` on some PyTorch versions, exercising the T3 disjunction
+- Are called once per `test_main` invocation, alongside the existing correctness sweeps
+
+Run on a Hopper cluster with `torchrun --standalone --nproc_per_node=8 ep/bench/test_intranode.py`
+or `torchrun --standalone --nproc_per_node=8 ep/bench/test_low_latency.py`. Either test
+deadlocking or asserting indicates a regression in the host-side or kernel-side empty-input
+handling.
+
 ## Deliberately Deferred: `mask_buffer_ptr` Port
 
 DeepEP includes a hang-recovery system controlled by `enable_shrink=True` on the Buffer
@@ -143,10 +168,14 @@ sizes across ranks (e.g., send requests to only one DP rank while others are idl
 
 ## Files Modified
 
-- `ep/src/uccl_ep.cc` — 3 commits on branch `fix/sglang-forward-idle-empty-input`:
+- `ep/src/uccl_ep.cc` — host-side fixes on branch `fix/sglang-forward-idle-empty-input`:
   - `79b894c fix(ep): allow num_tokens=0 in intranode_prepare and intranode_dispatch host wrappers` (T2)
   - `fd10252 fix(ep): permit topk_idx=nullptr when num_tokens=0 in get_dispatch_layout host wrapper` (T3)
   - `1a1f683 chore(ep): mirror LL host wrapper's cudaGetLastError pattern in intranode launches` (T4)
+- `ep/bench/test_intranode.py` — regression test:
+  - `8634b9b test(ep): add intranode empty-input regression test for SGLang forward_idle` (T8)
+- `ep/bench/test_low_latency.py` — regression test:
+  - `dd598cc test(ep): add LL empty-input regression test for SGLang forward_idle` (T9)
 
 ## Files Deliberately NOT Modified
 
