@@ -456,11 +456,10 @@ __global__ __launch_bounds__(1024, 1) void dispatch(
                                     max_nvl_peers, 0)
             : 0;
     if (dst_p2p_ptr == 0) {
-      if (responsible_expert_idx < 8) {
-        printf("[DBG dispatch_send_ibgda] rank=%d dst_rank=%d dst_expert_local=%d "
-               "num_tokens_sent=%d via_proxy\n",
-               rank, dst_rank, dst_expert_local_idx, num_tokens_sent);
-      }
+      printf("[DBG dispatch_send_ibgda] rank=%d dst_rank=%d dst_expert_local=%d "
+             "num_tokens_sent=%d ll_buf=%d via_proxy\n",
+             rank, dst_rank, dst_expert_local_idx, num_tokens_sent,
+             low_latency_buffer_idx);
       // Inter-node or no IPC: use IBGDA atomic
       uccl::nvshmemi_ibgda_amo_nonfetch_add(
           dst_ptr_internode, reinterpret_cast<uint64_t>(atomic_buffer_ptr),
@@ -469,12 +468,11 @@ __global__ __launch_bounds__(1024, 1) void dispatch(
           false, d2h_channel_addrs, num_d2h_channel_addrs, false,
           low_latency_buffer_idx);
     } else {
-      if (responsible_expert_idx < 8) {
-        printf("[DBG dispatch_send_ipc] rank=%d dst_rank=%d dst_expert_local=%d "
-               "num_tokens_sent=%d sentinel=%d dst_p2p=%p\n",
-               rank, dst_rank, dst_expert_local_idx, num_tokens_sent,
-               -num_tokens_sent - 1, (void*)dst_p2p_ptr);
-      }
+      printf("[DBG dispatch_send_ipc] rank=%d dst_rank=%d dst_expert_local=%d "
+             "num_tokens_sent=%d sentinel=%d ll_buf=%d dst_p2p=%p\n",
+             rank, dst_rank, dst_expert_local_idx, num_tokens_sent,
+             -num_tokens_sent - 1, low_latency_buffer_idx,
+             (void*)dst_p2p_ptr);
       // Intra-node: use direct atomic operation
       st_release_sys_global<kUseAggressiveAtomic>(
           reinterpret_cast<int*>(dst_p2p_ptr), -num_tokens_sent - 1);
@@ -546,12 +544,14 @@ LOW_LATENCY_DISPATCH_RECV:
       auto start_time = clock64();
       auto last_print_time = start_time;
       bool printed_entry = false;
+      bool was_spinning = false;
       while ((src_rank / max_nvl_peers == rank / max_nvl_peers) &&
              (num_recv_tokens_ipc = ld_acquire_sys_global<kUseAggressiveAtomic>(
                   rdma_recv_count + local_expert_idx * num_ranks + src_rank)) ==
                  0) {
+        was_spinning = true;
         auto now = clock64();
-        if (!printed_entry && responsible_expert_idx == 0) {
+        if (!printed_entry && responsible_expert_idx < 8) {
           printf("[DBG dispatch_recv_ipc] rank=%d local_expert=%d src_rank=%d "
                  "responsible_expert=%d ENTER spin\n",
                  rank, local_expert_idx, src_rank, responsible_expert_idx);
@@ -567,6 +567,16 @@ LOW_LATENCY_DISPATCH_RECV:
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
         __builtin_amdgcn_s_sleep(1);
 #endif
+      }
+      // Print on EXIT spin (or if did not need to spin)
+      if (src_rank / max_nvl_peers == rank / max_nvl_peers &&
+          responsible_expert_idx < 16) {
+        auto _exit_t = clock64();
+        printf("[DBG dispatch_recv_ipc_exit] rank=%d src=%d local_exp=%d resp=%d val=%d ll_buf=%d spun=%d wait_cyc=%llu\n",
+               rank, src_rank, local_expert_idx, responsible_expert_idx,
+               num_recv_tokens_ipc, low_latency_buffer_idx,
+               was_spinning ? 1 : 0,
+               (unsigned long long)(_exit_t - start_time));
       }
 
       while ((src_rank / max_nvl_peers != rank / max_nvl_peers) &&
