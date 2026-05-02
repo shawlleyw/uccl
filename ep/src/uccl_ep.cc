@@ -1191,8 +1191,8 @@ class Buffer {
                    "clean_low_latency_buffer requires barrier_signal_ptrs_gpu "
                    "to be initialized via Buffer::sync(...)");
     uccl::internode_ll::clean_low_latency_buffer(
-        ptr0, count0, ptr1, count1, barrier_signal_ptrs_gpu, rank, num_ranks,
-        stream);
+        ptr0, count0, ptr1, count1, barrier_signal_ptrs_gpu, nvl_rank,
+        num_nvl_ranks, stream);
   }
 
   std::tuple<std::optional<EventHandle>, std::optional<std::function<void()>>>
