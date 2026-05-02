@@ -1187,8 +1187,12 @@ class Buffer {
     check_boundary(ptr1, count1 * sizeof(int));
 
     auto stream = reinterpret_cast<cudaStream_t>(stream_ptr);
-    uccl::internode_ll::clean_low_latency_buffer(ptr0, count0, ptr1, count1,
-                                                 stream);
+    EP_HOST_ASSERT(barrier_signal_ptrs_gpu != nullptr &&
+                   "clean_low_latency_buffer requires barrier_signal_ptrs_gpu "
+                   "to be initialized via Buffer::sync(...)");
+    uccl::internode_ll::clean_low_latency_buffer(
+        ptr0, count0, ptr1, count1, barrier_signal_ptrs_gpu, rank, num_ranks,
+        stream);
   }
 
   std::tuple<std::optional<EventHandle>, std::optional<std::function<void()>>>
