@@ -266,6 +266,212 @@ def test_main(
         if local_rank == 0:
             print(" passed", flush=True)
 
+    def _run_empty_input_scenario(empty_ranks, label):
+        is_empty = rank in empty_ranks
+
+        if local_rank == 0:
+            print(
+                f"[empty-input-rank/{label}] forcing ranks {sorted(empty_ranks)} to send 0 tokens ...",
+                flush=True,
+                end="",
+            )
+
+        # Build per-rank input. Empty ranks: zero-row tensors.
+        if is_empty:
+            local_x = torch.empty((0, hidden), dtype=torch.bfloat16, device="cuda")
+            local_topk_idx = torch.empty(
+                (0, num_topk), dtype=torch.int64, device="cuda"
+            )
+            local_topk_weights = torch.empty(
+                (0, num_topk), dtype=torch.float32, device="cuda"
+            )
+        else:
+            local_x = (
+                torch.ones((num_tokens, hidden), dtype=torch.bfloat16, device="cuda")
+                * rank
+            )
+            # Deterministic round-robin routing across all experts (avoids RNG
+            # divergence between ranks). Same pattern as run_zero_recv_rank_test
+            # but routing across the FULL expert set since no rank is excluded.
+            token_offsets = torch.arange(
+                num_tokens, dtype=torch.int64, device="cuda"
+            ).unsqueeze(1)
+            topk_offsets = torch.arange(
+                num_topk, dtype=torch.int64, device="cuda"
+            ).unsqueeze(0)
+            local_topk_idx = (token_offsets + topk_offsets) % num_experts
+            local_topk_weights = torch.ones(
+                (num_tokens, num_topk), dtype=torch.float32, device="cuda"
+            ) * (rank + 1)
+
+        # Build dispatch metadata. Handle empty case explicitly.
+        if local_x.size(0) == 0:
+            local_num_tokens_per_rank = torch.zeros(
+                (num_ranks,), dtype=torch.int, device="cuda"
+            )
+            local_num_tokens_per_expert = torch.zeros(
+                (num_experts,), dtype=torch.int, device="cuda"
+            )
+            local_is_token_in_rank = torch.zeros(
+                (0, num_ranks), dtype=torch.bool, device="cuda"
+            )
+        else:
+            local_rank_idx = local_topk_idx // (num_experts // num_ranks)
+            local_rank_idx.masked_fill_(local_topk_idx == -1, -1)
+            inplace_unique(local_rank_idx, num_ranks)
+
+            local_num_tokens_per_expert = torch.zeros(
+                (num_experts,), dtype=torch.int, device="cuda"
+            )
+            for i in range(num_experts):
+                local_num_tokens_per_expert[i] = (local_topk_idx == i).sum()
+
+            local_size = local_x.size(0)
+            local_num_tokens_per_rank = torch.empty(
+                (num_ranks,), dtype=torch.int, device="cuda"
+            )
+            local_token_idx_in_rank = torch.full(
+                (num_ranks, local_size), -1, dtype=torch.long, device="cuda"
+            )
+            for i in range(num_ranks):
+                local_num_tokens_per_rank[i] = (local_rank_idx == i).sum()
+                token_sel = (local_rank_idx == i).max(dim=-1)[0]
+                count = token_sel.sum().item()
+                tokens = torch.sort(token_sel.to(torch.int), descending=True)[1]
+                tokens[:count] = torch.sort(tokens[:count])[0]
+                local_token_idx_in_rank[i][tokens[:count]] = torch.arange(
+                    count, dtype=torch.long, device="cuda"
+                )
+            local_token_idx_in_rank = local_token_idx_in_rank.T.contiguous().to(
+                torch.int
+            )
+            local_is_token_in_rank = local_token_idx_in_rank >= 0
+
+        # Global aggregates for verification.
+        local_gbl_num_tokens_per_rank = local_num_tokens_per_rank.clone()
+        dist.all_reduce(local_gbl_num_tokens_per_rank, group=group)
+        local_gbl_num_tokens_per_expert = local_num_tokens_per_expert.clone()
+        dist.all_reduce(local_gbl_num_tokens_per_expert, group=group)
+
+        # Verify get_dispatch_layout handles empty input. This is the function
+        # whose host-side `EP_HOST_ASSERT(topk_idx_ptr != 0)` was loosened by T3.
+        ref_npr, _, ref_npe, ref_iir, _ = buffer.get_dispatch_layout(
+            local_topk_idx, num_experts
+        )
+        assert torch.allclose(
+            ref_npr, local_num_tokens_per_rank
+        ), f"rank {rank}: get_dispatch_layout num_tokens_per_rank mismatch"
+        assert torch.allclose(
+            ref_npe, local_num_tokens_per_expert
+        ), f"rank {rank}: get_dispatch_layout num_tokens_per_expert mismatch"
+        assert torch.allclose(
+            ref_iir, local_is_token_in_rank
+        ), f"rank {rank}: get_dispatch_layout is_token_in_rank mismatch"
+
+        # Dispatch.
+        (
+            recv_x,
+            recv_topk_idx,
+            recv_topk_weights,
+            recv_num_tokens_per_expert_list,
+            handle,
+            event,
+        ) = buffer.dispatch(
+            x=local_x,
+            topk_idx=local_topk_idx,
+            topk_weights=local_topk_weights,
+            num_tokens_per_rank=local_num_tokens_per_rank,
+            is_token_in_rank=local_is_token_in_rank,
+            num_tokens_per_expert=local_num_tokens_per_expert,
+            config=config,
+        )
+        rank_prefix_matrix = handle[0]
+
+        # Verify recv counts.
+        expected_recv = int(local_gbl_num_tokens_per_rank[rank].item())
+        assert (
+            recv_x.size(0) == expected_recv
+        ), f"rank {rank}: recv_x.size(0)={recv_x.size(0)} != expected={expected_recv}"
+        assert (
+            local_gbl_num_tokens_per_expert.view(num_ranks, -1)[rank].tolist()
+            == recv_num_tokens_per_expert_list
+        ), f"rank {rank}: recv_num_tokens_per_expert_list mismatch"
+
+        # Empty ranks must contribute zero tokens to every other rank.
+        # rank_prefix_matrix[src][dst] = cumulative token count from src in dst's recv buffer.
+        # For an empty src, prefix should equal previous-row prefix (no contribution).
+        for empty_src in empty_ranks:
+            if empty_src == 0:
+                assert (
+                    rank_prefix_matrix[empty_src][rank].item() == 0
+                ), f"rank {rank}: empty src 0 contributed nonzero tokens"
+            else:
+                prev = rank_prefix_matrix[empty_src - 1][rank].item()
+                cur = rank_prefix_matrix[empty_src][rank].item()
+                assert prev == cur, (
+                    f"rank {rank}: empty src {empty_src} contributed nonzero tokens "
+                    f"(prefix went {prev} -> {cur})"
+                )
+
+        # Reuse the outer-scope check_data for non-empty source slices.
+        check_data(recv_x, rank_prefix_matrix)
+
+        # Cached dispatch path.
+        cached_recv_x, _, _, _, _, _ = buffer.dispatch(
+            x=local_x, handle=handle, config=config
+        )
+        assert torch.equal(
+            cached_recv_x, recv_x
+        ), f"rank {rank}: cached dispatch mismatch"
+
+        # Combine.
+        combined_x, combined_topk_weights, _ = buffer.combine(
+            x=recv_x,
+            handle=handle,
+            topk_weights=recv_topk_weights,
+            config=config,
+        )
+
+        if is_empty:
+            assert combined_x.size(0) == 0, (
+                f"empty rank {rank}: combined_x.size(0)={combined_x.size(0)} != 0"
+            )
+            assert (
+                combined_topk_weights.size(0) == 0
+            ), f"empty rank {rank}: combined_topk_weights.size(0) != 0"
+        else:
+            assert combined_x.size(0) == num_tokens, (
+                f"non-empty rank {rank}: combined_x.size(0)={combined_x.size(0)} "
+                f"!= num_tokens={num_tokens}"
+            )
+            # Reconstruction: each token is summed across all destination ranks
+            # that received it. Dividing by routed_rank_count recovers the input.
+            routed_rank_count = local_is_token_in_rank.sum(dim=1).unsqueeze(1)
+            check_x = combined_x.float() / routed_rank_count
+            assert calc_diff(check_x, local_x) < 5e-6, (
+                f"non-empty rank {rank}: reconstruction error "
+                f"{calc_diff(check_x, local_x)} >= 5e-6"
+            )
+            # Combine reconstructs original top-k weights by summing disjoint
+            # per-rank contributions (same property as run_zero_recv_rank_test).
+            assert (
+                calc_diff(combined_topk_weights, local_topk_weights) < 1e-9
+            ), f"non-empty rank {rank}: topk_weights reconstruction error"
+
+        if local_rank == 0:
+            print(" passed", flush=True)
+
+    def run_empty_input_rank_test():
+        if num_ranks < 2:
+            return
+        _run_empty_input_scenario(
+            empty_ranks={0, num_ranks - 1}, label="edges"
+        )
+        _run_empty_input_scenario(
+            empty_ranks=set(range(1, num_ranks)),
+            label="single-producer",
+        )
+
     for previous_mode in (False, True):
         for async_mode in (False, True):
             for current_x in filter(
@@ -452,6 +658,7 @@ def test_main(
         print("", flush=True)
 
     run_zero_recv_rank_test()
+    run_empty_input_rank_test()
 
     # Tune dispatch performance
     best_dispatch_results = None
