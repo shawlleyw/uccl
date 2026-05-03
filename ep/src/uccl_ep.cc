@@ -669,11 +669,6 @@ class Buffer {
         num_tokens, is_token_in_rank, channel_prefix_matrix, rank_prefix_matrix,
         num_memset_int, expert_alignment, buffer_ptrs_gpu,
         barrier_signal_ptrs_gpu, rank, comm_stream, num_channels);
-    auto err = cudaGetLastError();
-    if (err != cudaSuccess) {
-      printf("[notify_dispatch] kernel launch error: %s\n", cudaGetErrorString(err));
-      fflush(stdout);
-    }
 
     int num_recv_tokens = -1;
     std::vector<int> num_recv_tokens_per_expert_list;
@@ -741,11 +736,6 @@ class Buffer {
           reinterpret_cast<int*>(rank_prefix_matrix_ptr), num_memset_int,
           buffer_ptrs_gpu, barrier_signal_ptrs_gpu, rank, num_ranks,
           comm_stream);
-      auto err = cudaGetLastError();
-      if (err != cudaSuccess) {
-        printf("[cached_notify_dispatch] kernel launch error: %s\n", cudaGetErrorString(err));
-        fflush(stdout);
-      }
     }
 
     auto* x = reinterpret_cast<void*>(x_ptr);
@@ -777,13 +767,6 @@ class Buffer {
         buffer_ptrs_gpu, rank, num_ranks, comm_stream, config.num_sms,
         config.num_max_nvl_chunked_send_tokens,
         config.num_max_nvl_chunked_recv_tokens);
-    {
-      auto err = cudaGetLastError();
-      if (err != cudaSuccess) {
-        printf("[intranode_combine] kernel launch error: %s\n", cudaGetErrorString(err));
-        fflush(stdout);
-      }
-    }
 
     std::optional<EventHandle> event;
     if (async) {
@@ -825,13 +808,6 @@ class Buffer {
         buffer_ptrs_gpu, reinterpret_cast<int*>(send_head_ptr), num_channels,
         num_recv_tokens, num_channels * num_ranks * 2, barrier_signal_ptrs_gpu,
         rank, num_ranks, comm_stream);
-    {
-      auto err = cudaGetLastError();
-      if (err != cudaSuccess) {
-        printf("[cached_notify_combine] kernel launch error: %s\n", cudaGetErrorString(err));
-        fflush(stdout);
-      }
-    }
 
     void* bias_ptrs[2] = {
         bias_0_ptr == 0 ? nullptr : reinterpret_cast<void*>(bias_0_ptr),
@@ -852,11 +828,6 @@ class Buffer {
         hidden, num_topk, buffer_ptrs_gpu, rank, num_ranks, comm_stream,
         config.num_sms, config.num_max_nvl_chunked_send_tokens,
         config.num_max_nvl_chunked_recv_tokens);
-    auto err = cudaGetLastError();
-    if (err != cudaSuccess) {
-      printf("[intranode_combine] kernel launch error: %s\n", cudaGetErrorString(err));
-      fflush(stdout);
-    }
 
     std::optional<EventHandle> event;
     if (async) {
